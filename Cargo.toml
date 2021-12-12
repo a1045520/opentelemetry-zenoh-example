@@ -16,3 +16,6 @@ clap = "2.33.3"
 opentelemetry = { version = "0.16.0", features = ["rt-async-std"] }
 opentelemetry-jaeger = { version = "0.15.0", features = ["rt-async-std", "reqwest_collector_client"] }
 opentelemetry-semantic-conventions = "0.8.0"
+serde_json = "1.0.72"
+serde = "1.0.131"
+rand = "0.8.4"

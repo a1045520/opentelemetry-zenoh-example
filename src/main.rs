@@ -10,11 +10,14 @@ use opentelemetry::{
     sdk::{trace as sdktrace, propagation::TraceContextPropagator},
     trace::{FutureExt, TraceContextExt, Tracer},
     Context,
+    KeyValue,
 };
 use opentelemetry_semantic_conventions::{resource, trace};
 use opentelemetry_jaeger;
 use std::collections::HashMap;
 use std::time;
+use serde::{Deserialize, Serialize};
+use rand::Rng;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -42,19 +45,46 @@ async fn main() {
     opentelemetry::global::shutdown_tracer_provider();
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct Message{
+    sleep_time: u64,
+    span_context: String,
+}
+
 async fn sensor(workspace: zenoh::Workspace<'_>) {
-    let span = global::tracer("Sensor.rs").start("Send sensor data");
+    let tracer = global::tracer("Sensor.rs");
+    // Use tracer.start("span_name") could start the span without span builder
+    let span = tracer
+        .span_builder("generate sensor data")
+        .with_attributes(vec![
+            trace::MESSAGING_SYSTEM.string("zenoh"),
+            trace::MESSAGING_OPERATION.string("send"),
+            trace::MESSAGING_DESTINATION.string("computing")
+        ])
+        .start(&tracer);
     let cx = Context::current_with_span(span);
     let mut injector = HashMap::new();
     // Injector trace context 
     global::get_text_map_propagator(|propagator| propagator.inject_context(&cx, &mut injector));
 
-    // Wait for sensor data to be ready
-    task::sleep(time::Duration::from_millis(100)).await;
+    // Sleep to simulate taking data from the driver
+    let mut rng = rand::thread_rng();
+    task::sleep(time::Duration::from_millis(rng.gen_range(0..100))).await;
+    
+    let message = Message {
+        sleep_time: rng.gen_range(50..150),
+        span_context: injector["traceparent"].clone(),
+    };
+    let serialized_message = serde_json::to_string(&message).unwrap();
 
-    // Put the sensor data
+    cx.span().add_event("sensor data".into(), 
+        vec![
+            KeyValue::new("sleeping time", message.sleep_time.to_string()),
+            KeyValue::new("span context", message.span_context.to_string())
+            ]
+    );  
     workspace
-        .put(&"/sensor_data".try_into().unwrap(), injector["traceparent"].clone().into())
+        .put(&"/sensor_data".try_into().unwrap(), serialized_message.into())
         .with_context(cx.clone())
         .await
         .unwrap();
@@ -74,42 +104,49 @@ async fn computing(workspace: zenoh::Workspace<'_>) {
                 let change = change.unwrap();
                 let mut req_header = HashMap::new();
                 if let Value::StringUtf8(value) = change.value.unwrap(){
-                    req_header.insert("traceparent".to_string(), value.clone());
+                    let message: Message = serde_json::from_str(&value).unwrap();
+                    req_header.insert("traceparent".to_string(), message.span_context.clone());
 
                     println!(
                         ">> [Subscription listener] received {:?} for {} : {:?} with timestamp {}",
                         change.kind,
                         change.path,
-                        value,
+                        message,
                         change.timestamp
-                    )
+                    );
+
+                    // Extract trace format to get parent context
+                    let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&req_header));
+                    let tracer = global::tracer("Computing.rs");
+                    // Use tracer.start_with_context("span_name", parent_cx) could run the span without span builder
+                    let span = tracer
+                        .span_builder("Get sensor data and start computing")
+                        .with_attributes(vec![
+                            trace::MESSAGING_SYSTEM.string("zenoh"),
+                            trace::MESSAGING_OPERATION.string("process"),
+                            trace::MESSAGING_DESTINATION.string("motion")
+                        ])
+                        .with_parent_context(parent_cx)
+                        .start(&tracer);
+                    let cx = Context::current_with_span(span);
+                    global::get_text_map_propagator(|propagator| propagator.inject_context(&cx, &mut req_header));
+                    
+                    // Sleep to simulate computing the action
+                    task::sleep(time::Duration::from_millis(message.sleep_time)).await;
+
+                    let mut rng = rand::thread_rng();
+                    let message = Message {
+                        sleep_time: rng.gen_range(0..100),
+                        span_context: req_header["traceparent"].clone(),
+                    };
+                    let serialized_message = serde_json::to_string(&message).unwrap();
+
+                    workspace
+                        .put(&"/action".try_into().unwrap(), serialized_message.into())
+                        .with_context(cx.clone())
+                        .await
+                        .unwrap();
                 };
-                // Extract trace format to get parent context
-                let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&req_header));
-
-                // Prebuild the span and add attributes, ref: https://github.com/open-telemetry/opentelemetry-specification/tree/main/specification/trace/semantic_conventions
-                let mut attributes = Vec::with_capacity(13);
-                attributes.push(trace::MESSAGING_SYSTEM.string("Zenoh"));
-                attributes.push(trace::MESSAGING_OPERATION.string("Send"));
-                attributes.push(trace::MESSAGING_DESTINATION.string("Motion"));
-                let span = global::tracer("Computing.rs")
-                                .span_builder("Get sensor data and start computing")
-                                .with_attributes(attributes)
-                                .with_parent_context(parent_cx);
-
-                // Start tracing 
-                let span = span.start(&global::tracer("Computing.rs"));
-                let cx = Context::current_with_span(span);
-                global::get_text_map_propagator(|propagator| propagator.inject_context(&cx, &mut req_header));
-                
-                // Computing
-                task::sleep(time::Duration::from_millis(300)).await;
-
-                workspace
-                .put(&"/action".try_into().unwrap(), req_header["traceparent"].clone().into())
-                .with_context(cx.clone())
-                .await
-                .unwrap();
             }
 
             _ = stdin.read_exact(&mut input).fuse() => {
@@ -134,24 +171,31 @@ async fn motion(workspace: zenoh::Workspace<'_>) {
                 let change = change.unwrap();
                 let mut req_header = HashMap::new();
                 if let Value::StringUtf8(value) = change.value.unwrap(){
-                    req_header.insert("traceparent".to_string(), value.clone());
+                    let message: Message = serde_json::from_str(&value).unwrap();
+                    req_header.insert("traceparent".to_string(), message.span_context.clone());
 
                     println!(
                         ">> [Subscription listener] received {:?} for {} : {:?} with timestamp {}",
                         change.kind,
                         change.path,
-                        value,
+                        message,
                         change.timestamp
-                    )
-                };
-                // Extract trace format to get parent context
-                let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&req_header));
-                // Start tracing without attribute
-                let _span = global::tracer("motion.rs")
-                .start_with_context("Get computing output and start motion", parent_cx);
+                    );
+                    
+                    let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&req_header));
+                    let tracer = global::tracer("motion.rs");
+                    let _span = tracer
+                        .span_builder("Get computing output and start motion")
+                        .with_attributes(vec![
+                            trace::MESSAGING_SYSTEM.string("zenoh"),
+                            trace::MESSAGING_OPERATION.string("receive"),
+                        ])
+                        .with_parent_context(parent_cx)
+                        .start(&tracer);
 
-                // Motion
-                task::sleep(time::Duration::from_millis(100)).await;
+                    // Sleep to simulate motion control
+                    task::sleep(time::Duration::from_millis(message.sleep_time)).await;
+                };  
             }
 
             _ = stdin.read_exact(&mut input).fuse() => {
